@@ -48,6 +48,35 @@ async def upload_pdf(file: UploadFile = File(...)):
             detail={"error": "UPLOAD_FAILED", "message": "PDF 업로드 처리 중 서버 오류가 발생했습니다."}
         )
 
+@router.post("/{pdf_id}/jobs/question-generation", status_code=202)
+async def create_question_generation_job(pdf_id: str):
+    """
+    문제 생성 Job 시작
+    
+    - **pdf_id**: PDF ID
+    """
+    from app.storage.pdf_store import PDFStore
+    import subprocess
+    import time
+    
+    # PDF 존재 확인
+    if not PDFStore.pdf_exists(pdf_id):
+        raise PDFNotFoundError(pdf_id)
+    
+    # Job ID 생성
+    job_id = f"job_{pdf_id}_{int(time.time())}"
+    
+    # 엔진 실행 (백그라운드)
+    subprocess.Popen([
+        "python", "-m", "backend.engine.cli.run_job",
+        "--pdf_id", pdf_id
+    ])
+    
+    return {
+        "job_id": job_id,
+        "pdf_id": pdf_id,
+        "status": "QUEUED"
+    }
 
 @router.get("/{pdf_id}/questions", response_model=QuestionListResponse)
 async def get_questions(pdf_id: str):
