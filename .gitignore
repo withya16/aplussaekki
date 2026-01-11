@@ -9,6 +9,9 @@ data/
 artifacts/
 *.pdf
 
+# Environment
+.env
+
 # IDE
 .vscode/
 .DS_Store

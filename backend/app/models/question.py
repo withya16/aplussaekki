@@ -16,3 +16,4 @@ class QuestionListResponse(BaseModel):
     """문제 목록 응답"""
     items: List[Question]
 
+

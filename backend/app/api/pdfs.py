@@ -1,9 +1,10 @@
 """PDF API"""
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Body
 from app.services.pdf_service import PDFService
 from app.storage.question_store import QuestionStore
 from app.models.pdf import PDFStatus
 from app.models.question import QuestionListResponse, Question
+from app.models.job import JobCreateBody, JobCreateResponse
 from app.core.errors import PDFNotFoundError
 
 router = APIRouter(prefix="/pdfs", tags=["pdfs"])
@@ -48,12 +49,13 @@ async def upload_pdf(file: UploadFile = File(...)):
             detail={"error": "UPLOAD_FAILED", "message": "PDF 업로드 처리 중 서버 오류가 발생했습니다."}
         )
 
-@router.post("/{pdf_id}/jobs/question-generation", status_code=202)
-async def create_question_generation_job(pdf_id: str):
+@router.post("/{pdf_id}/jobs/question-generation", response_model=JobCreateResponse, status_code=202)
+async def create_question_generation_job(pdf_id: str, body: JobCreateBody = Body(...)):
     """
     문제 생성 Job 시작
     
     - **pdf_id**: PDF ID
+    - **body**: Job 생성 요청 Body (num_questions, difficulty, types_ratio, chunking)
     """
     from app.storage.pdf_store import PDFStore
     import subprocess
@@ -66,17 +68,29 @@ async def create_question_generation_job(pdf_id: str):
     # Job ID 생성
     job_id = f"job_{pdf_id}_{int(time.time())}"
     
-    # 엔진 실행 (백그라운드)
-    subprocess.Popen([
-        "python", "-m", "backend.engine.cli.run_job",
-        "--pdf_id", pdf_id
-    ])
+    # Job 생성 및 저장
+    from app.storage.job_store import JobStore
+    job = JobStore.create_job(job_id, pdf_id)
     
-    return {
-        "job_id": job_id,
-        "pdf_id": pdf_id,
-        "status": "QUEUED"
-    }
+    # TODO: body 파라미터를 엔진에 전달하는 로직 필요
+    # 현재는 엔진이 이 파라미터들을 어떻게 받는지 확인 필요
+    # 엔진 실행 (백그라운드)
+    # run_job.py는 backend 폴더에서 실행해야 core 모듈을 찾을 수 있음
+    from pathlib import Path
+    # app/api/pdfs.py -> app -> backend (parents[2])
+    backend_dir = Path(__file__).resolve().parents[2]
+    subprocess.Popen([
+        "python", "-m", "engine.cli.run_job",
+        "--pdf_id", pdf_id,
+        "--job_id", job_id
+        # body의 파라미터들을 엔진에 전달하는 방법 구현 필요
+    ], cwd=str(backend_dir))
+    
+    return JobCreateResponse(
+        job_id=job_id,
+        pdf_id=pdf_id,
+        status="QUEUED"
+    )
 
 @router.get("/{pdf_id}/questions", response_model=QuestionListResponse)
 async def get_questions(pdf_id: str):
@@ -101,7 +115,20 @@ async def get_questions(pdf_id: str):
         if isinstance(q_data, Question):
             questions.append(q_data)
         else:
-            questions.append(Question(**q_data))
+            # JSON 데이터 필드명을 모델 필드명으로 변환
+            # question_text -> question
+            q_dict = dict(q_data)
+            if 'question_text' in q_dict and 'question' not in q_dict:
+                q_dict['question'] = q_dict.pop('question_text')
+            # Question 모델에 없는 필드는 제거 (difficulty, verdict, answer, explanation 등)
+            filtered_dict = {
+                'question_id': q_dict.get('question_id'),
+                'type': q_dict.get('type'),
+                'question': q_dict.get('question'),
+                'options': q_dict.get('options'),
+                'source': q_dict.get('source')  # optional 필드
+            }
+            questions.append(Question(**filtered_dict))
     
     return QuestionListResponse(items=questions)
 

@@ -3,4 +3,7 @@ uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
 pydantic>=2.0.0
 pypdf==4.3.1
+pymupdf>=1.23.0  # PyMuPDF (fitz 모듈)
+openai>=1.0.0  # OpenAI API
+python-dotenv>=1.0.0  # .env 파일 로드
 

@@ -9,3 +9,4 @@ class PDFStatus(BaseModel):
     status: Literal["UPLOADED", "PROCESSING", "COMPLETED", "FAILED"]
     page_count: int
 
+

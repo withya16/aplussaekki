@@ -9,6 +9,9 @@ DATA_DIR = BASE_DIR / "data"
 PDF_DIR = DATA_DIR / "pdfs"
 JOB_DIR = DATA_DIR / "jobs"
 QUESTION_DIR = DATA_DIR / "questions"
+QUESTIONS_DIR = QUESTION_DIR  # 별칭 (question_store에서 사용)
+RESULTS_DIR = DATA_DIR / "results"  # 엔진이 저장하는 경로
+HISTORY_DIR = DATA_DIR / "history"  # history_store에서 사용
 
 
 def ensure_dirs() -> None:
@@ -16,6 +19,8 @@ def ensure_dirs() -> None:
     PDF_DIR.mkdir(parents=True, exist_ok=True)
     JOB_DIR.mkdir(parents=True, exist_ok=True)
     QUESTION_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_pdf_path(pdf_id: str) -> Path:

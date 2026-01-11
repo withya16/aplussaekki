@@ -11,18 +11,55 @@ Original file is located at
 
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any
-from app.core.paths import QUESTIONS_DIR
+from typing import Optional, Dict, Any, List
+from app.core.paths import RESULTS_DIR, QUESTIONS_DIR
 
 class QuestionStore:
     """
-    data/questions/{pdf_id}.questions.json 파일에서 문제를 조회함
+    data/results/{pdf_id}.questions.json 파일에서 문제를 조회함 (엔진이 저장하는 경로)
+    없으면 data/questions/{pdf_id}.questions.json도 확인 (하위 호환성)
     """
 
     @staticmethod
+    def load_questions(pdf_id: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        PDF ID로 모든 문제 목록을 로드
+        엔진이 저장하는 경로(data/results)를 우선적으로 확인
+        """
+        # 우선적으로 엔진이 저장하는 경로 확인
+        file_path = RESULTS_DIR / f"{pdf_id}.questions.json"
+        
+        # 없으면 하위 호환성을 위해 기존 경로도 확인
+        if not file_path.exists():
+            file_path = QUESTIONS_DIR / f"{pdf_id}.questions.json"
+
+        if not file_path.exists():
+            return None
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # 루트가 dict이고 "questions" 키 안에 리스트가 있는 구조 처리
+            if isinstance(data, dict) and "questions" in data:
+                questions_list = data["questions"]
+            else:
+                # 혹시라도 리스트로 바로 되어있는 경우를 대비
+                questions_list = data if isinstance(data, list) else []
+
+            return questions_list
+        except Exception as e:
+            print(f"Error loading questions: {e}")
+            return None
+
+    @staticmethod
     def get_question(pdf_id: str, question_id: str) -> Optional[Dict[str, Any]]:
-        # [수정 1] 파일명 규칙 맞춤 (ex: Ch6.questions.json)
-        file_path = QUESTIONS_DIR / f"{pdf_id}.questions.json"
+        # 엔진이 저장하는 경로(data/results)를 우선적으로 확인
+        file_path = RESULTS_DIR / f"{pdf_id}.questions.json"
+        
+        # 없으면 하위 호환성을 위해 기존 경로도 확인
+        if not file_path.exists():
+            file_path = QUESTIONS_DIR / f"{pdf_id}.questions.json"
 
         if not file_path.exists():
             print(f"File not found: {file_path}")

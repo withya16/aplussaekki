@@ -1,4 +1,11 @@
 """FastAPI 메인 애플리케이션"""
+from pathlib import Path
+from dotenv import load_dotenv
+
+# .env 파일 로드 (backend 디렉토리 기준)
+env_path = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=env_path)
+
 from fastapi import FastAPI
 from app.api import api_router
 
@@ -24,4 +31,5 @@ async def root():
 async def health():
     """헬스 체크"""
     return {"status": "ok"}
+
 
