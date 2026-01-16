@@ -39,9 +39,11 @@ class GradingService:
         feedback = ""
 
         if q_type == "MCQ":
+            # [객관식] 대소문자 무시 (A == a)
             is_correct = (user_answer_str.upper() == correct_answer.upper())
         else:
-            is_correct = (user_answer_str == correct_answer)
+            # [단답형/주관식] 대소문자 무시 (Apple == apple)
+            is_correct = (user_answer_str.lower() == correct_answer.lower())
 
         score = 10 if is_correct else 0
         feedback = "정답입니다!" if is_correct else f"아쉽네요. 정답은 {correct_answer}입니다."
