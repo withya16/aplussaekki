@@ -72,19 +72,24 @@ async def create_question_generation_job(pdf_id: str, body: JobCreateBody = Body
     from app.storage.job_store import JobStore
     job = JobStore.create_job(job_id, pdf_id)
     
-    # TODO: body 파라미터를 엔진에 전달하는 로직 필요
-    # 현재는 엔진이 이 파라미터들을 어떻게 받는지 확인 필요
     # 엔진 실행 (백그라운드)
     # run_job.py는 backend 폴더에서 실행해야 core 모듈을 찾을 수 있음
     from pathlib import Path
     # app/api/pdfs.py -> app -> backend (parents[2])
     backend_dir = Path(__file__).resolve().parents[2]
-    subprocess.Popen([
+
+    # body 파라미터를 엔진에 전달
+    cmd = [
         "python", "-m", "engine.cli.run_job",
         "--pdf_id", pdf_id,
-        "--job_id", job_id
-        # body의 파라미터들을 엔진에 전달하는 방법 구현 필요
-    ], cwd=str(backend_dir))
+        "--job_id", job_id,
+        "--num_questions", str(body.num_questions),
+        "--difficulty", body.difficulty,
+        "--mcq_ratio", str(body.types_ratio.MCQ),
+        "--saq_ratio", str(body.types_ratio.SAQ),
+    ]
+
+    subprocess.Popen(cmd, cwd=str(backend_dir))
     
     return JobCreateResponse(
         job_id=job_id,
