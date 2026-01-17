@@ -10,7 +10,13 @@ import time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from core.mm_table_presence import detect_table_presence_mm
+from core.mm_table_presence import detect_table_presence_mm, detect_table_presence_batch
+
+
+# =============================================================================
+# 상수
+# =============================================================================
+DEFAULT_BATCH_SIZE = 5  # 한 번의 API 호출로 처리할 페이지 수
 
 
 def _atomic_write_json(path: Path, obj: Dict[str, Any]) -> None:
@@ -48,6 +54,11 @@ def _retry(fn, max_retries: int = 5, base_delay: float = 1.0):
     raise last
 
 
+def _chunk_list(lst: List[Any], chunk_size: int) -> List[List[Any]]:
+    """리스트를 chunk_size 크기의 청크들로 분할"""
+    return [lst[i:i + chunk_size] for i in range(0, len(lst), chunk_size)]
+
+
 def run(
     out_dir: Path = Path("artifacts/lecture"),
     pdf_id: str = "lecture",
@@ -56,6 +67,8 @@ def run(
     max_retries: int = 5,
     retry_errors: bool = True,
     flush_every: int = 1,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    use_batch: bool = True,
 ) -> Dict[str, Any]:
 
     out_dir = Path(out_dir)
@@ -89,6 +102,25 @@ def run(
     todo: List[Tuple[int, Path]] = [(_page_index(p), p) for p in pngs if _should_do(_page_index(p))]
     todo.sort(key=lambda x: x[0])
 
+    if not todo:
+        print(f"[presence] 처리할 페이지 없음 (이미 완료)")
+        return _load_json_safe(status_path) or {}
+
+    # 배치 처리 모드
+    if use_batch and batch_size > 1:
+        return _run_batch_mode(
+            todo=todo,
+            out_dir=out_dir,
+            pdf_id=pdf_id,
+            page_count_total=page_count_total,
+            pages_status=pages_status,
+            status_path=status_path,
+            max_workers=max_workers,
+            max_retries=max_retries,
+            batch_size=batch_size,
+        )
+
+    # 기존 개별 처리 모드 (fallback)
     def _detect(pi: int, png: Path) -> Tuple[int, Path, bool, Optional[str], int]:
         def _do(attempt: int):
             r = detect_table_presence_mm(png, pi)
@@ -96,7 +128,7 @@ def run(
         has_table, attempts = _retry(_do, max_retries=max_retries)
         return pi, png, bool(has_table), None, attempts
 
-    print(f"[presence] total_pages={len(all_pngs)} selected={len(pngs)} todo={len(todo)} workers={max_workers}")
+    print(f"[presence] total_pages={len(all_pngs)} selected={len(pngs)} todo={len(todo)} workers={max_workers} (개별모드)")
 
     completed = 0
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -139,8 +171,97 @@ def run(
     return _load_json_safe(status_path) or {}
 
 
+def _run_batch_mode(
+    todo: List[Tuple[int, Path]],
+    out_dir: Path,
+    pdf_id: str,
+    page_count_total: int,
+    pages_status: Dict[int, Dict[str, Any]],
+    status_path: Path,
+    max_workers: int,
+    max_retries: int,
+    batch_size: int,
+) -> Dict[str, Any]:
+    """
+    배치 모드: 여러 페이지를 한 번의 API 호출로 처리
+
+    기존 N번 호출 → ceil(N/batch_size)번 호출로 감소
+    예: 50페이지, batch_size=5 → 50회 → 10회 (80% 감소)
+    """
+    # 배치로 분할
+    batches = _chunk_list(todo, batch_size)
+    total_batches = len(batches)
+    total_pages = len(todo)
+
+    print(f"[presence] 배치 모드: {total_pages}페이지 → {total_batches}배치 (batch_size={batch_size}, workers={max_workers})")
+
+    def _detect_batch(batch: List[Tuple[int, Path]], batch_idx: int):
+        def _do(attempt: int):
+            results = detect_table_presence_batch(batch)
+            return results, attempt
+        results, attempts = _retry(_do, max_retries=max_retries)
+        return batch_idx, batch, results, attempts
+
+    completed_batches = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_detect_batch, batch, idx): (idx, batch) for idx, batch in enumerate(batches)}
+
+        for fut in as_completed(futures):
+            completed_batches += 1
+            batch_idx, batch = futures[fut]
+            try:
+                _, _, results, attempts = fut.result()
+
+                for (pi, png), result in zip(batch, results):
+                    pages_status[pi] = {
+                        "page_index": pi,
+                        "page_png": str(png.relative_to(out_dir)),
+                        "has_table": result.has_table,
+                        "status": "ok",
+                        "attempts": attempts,
+                        "batch_idx": batch_idx,
+                    }
+
+                table_pages = sum(1 for r in results if r.has_table)
+                print(f"[batch {completed_batches}/{total_batches}] {len(batch)}페이지 처리완료 (표={table_pages}, attempts={attempts})")
+
+            except Exception as e:
+                print(f"[batch {completed_batches}/{total_batches}] ERROR: {repr(e)}")
+                # 배치 실패 시 에러 상태로 기록
+                for pi, png in batch:
+                    pages_status[pi] = {
+                        "page_index": pi,
+                        "page_png": str(png.relative_to(out_dir)),
+                        "has_table": False,
+                        "status": "error",
+                        "error": str(e),
+                    }
+
+            # 진행상황 저장
+            _atomic_write_json(status_path, {
+                "pdf_id": pdf_id,
+                "page_count": page_count_total,
+                "updated_at": datetime.now(timezone.utc).astimezone().isoformat(),
+                "prompt_version": "presence_v2_batch",
+                "batch_size": batch_size,
+                "pages": sorted(pages_status.values(), key=lambda x: x["page_index"]),
+                "summary": {
+                    "num_pages": len(pages_status),
+                    "num_ok": sum(1 for v in pages_status.values() if v.get("status") == "ok"),
+                    "num_errors": sum(1 for v in pages_status.values() if v.get("status") == "error"),
+                    "num_has_table": sum(
+                        1 for v in pages_status.values()
+                        if v.get("status") == "ok" and v.get("has_table") is True
+                    ),
+                }
+            })
+
+    return _load_json_safe(status_path) or {}
+
+
 # =========================
-# CLI wrapper (NEW)
+# CLI wrapper
 # =========================
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -152,6 +273,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     ap.add_argument("--max_retries", type=int, default=5)
     ap.add_argument("--no_retry_errors", action="store_true")
     ap.add_argument("--flush_every", type=int, default=1)
+    ap.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help=f"배치당 페이지 수 (default: {DEFAULT_BATCH_SIZE})")
+    ap.add_argument("--no_batch", action="store_true", help="배치 모드 비활성화 (개별 처리)")
     ap.add_argument("--print_json", action="store_true", help="결과 JSON을 stdout으로 출력")
 
     args = ap.parse_args(argv)
@@ -164,6 +287,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         max_retries=args.max_retries,
         retry_errors=not args.no_retry_errors,
         flush_every=args.flush_every,
+        batch_size=args.batch_size,
+        use_batch=not args.no_batch,
     )
 
     if args.print_json:
@@ -172,6 +297,3 @@ def main(argv: Optional[list[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
-
-

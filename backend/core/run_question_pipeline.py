@@ -1,6 +1,9 @@
 # core/run_question_pipeline.py
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 import argparse
 import json
 import logging
@@ -14,7 +17,15 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Callable, Tuple
 
 from core.question_generator import QuestionGenConfig, generate_questions_for_job
-from core.question_verifier import verify_questions_for_job
+from core.question_verifier import verify_questions_for_job, verify_questions_batch
+from core.llm_verifier import verify_questions_llm, merge_verification_results, LLMVerifyConfig
+from core.aggregate_verifier import (
+    verify_aggregate,
+    identify_regeneration_targets,
+    remove_duplicates,
+    save_aggregate_result,
+    AggregateVerifyResult,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -332,24 +343,25 @@ class ErrorType:
 # NEW: API-spec job state writer (data/jobs/{job_id}.json)
 # =============================================================================
 
-def _spec_status_and_progress(local_status: str) -> Tuple[str, Dict[str, Any]]:
+def _spec_status_and_progress(local_status: str, progress_value: Optional[float] = None) -> Tuple[str, Dict[str, Any]]:
     """
     runner 내부 상태를 API 명세 상태/진행률로 매핑.
     - 명세 status: QUEUED/RUNNING/DONE/FAILED
     - 명세 progress.stage: PARSING/GENERATING/VERIFYING/SAVING
+    - 명세 progress.progress: 0.0 ~ 1.0 (정량적 진행률)
     """
     if local_status == JobStatusLocal.QUEUED:
-        return "QUEUED", {"stage": "PARSING"}
+        return "QUEUED", {"stage": "PARSING", "progress": progress_value or 0.0}
     if local_status == JobStatusLocal.GENERATING:
-        return "RUNNING", {"stage": "GENERATING"}
+        return "RUNNING", {"stage": "GENERATING", "progress": progress_value or 0.3}
     if local_status == JobStatusLocal.VERIFYING:
-        return "RUNNING", {"stage": "VERIFYING"}
+        return "RUNNING", {"stage": "VERIFYING", "progress": progress_value or 0.7}
     if local_status == JobStatusLocal.DONE:
-        return "DONE", {"stage": "SAVING"}
+        return "DONE", {"stage": "SAVING", "progress": 1.0}
     if local_status == JobStatusLocal.FAILED:
-        return "FAILED", {"stage": "SAVING"}
+        return "FAILED", {"stage": "SAVING", "progress": progress_value or 0.0}
     # fallback
-    return "RUNNING", {"stage": "GENERATING"}
+    return "RUNNING", {"stage": "GENERATING", "progress": progress_value or 0.5}
 
 
 def _write_job_state(
@@ -365,6 +377,7 @@ def _write_job_state(
     error_code: Optional[str] = None,
     error_message: Optional[str] = None,
     detail_stage: Optional[str] = None,
+    progress_value: Optional[float] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
@@ -372,7 +385,7 @@ def _write_job_state(
       data/jobs/{job_id}.json
     프론트의 GET /jobs/{job_id} 구현 시 이 파일을 그대로 읽어 반환 가능하도록 설계.
     """
-    status, progress = _spec_status_and_progress(local_status)
+    status, progress = _spec_status_and_progress(local_status, progress_value)
 
     if detail_stage:
         # optional
@@ -511,6 +524,10 @@ def run(
     save_generated: bool = False,
     # NEW
     data_dir: Path = Path("data"),
+    # 검증 파이프라인 옵션
+    enable_llm_verify: bool = True,
+    target_total: int = 0,  # 0이면 job_targets 합계 사용
+    max_regeneration_rounds: int = 2,
 ) -> Dict[str, Any]:
 
     jobs_path = _resolve_jobs_path(out_dir, jobs_jsonl)
@@ -827,11 +844,127 @@ def run(
             model_plan=model_plan,
         )
 
+        # Phase 1: 구조 검증
         verified = verify_questions_for_job(
             job=job,
             generator_result=last_gen,
             evidence_chunks=None,
         )
+
+        # Phase 2: LLM 품질 검증 (OK인 문제만)
+        if enable_llm_verify:
+            ok_questions = [
+                q for q in verified.get("questions", [])
+                if q.get("verdict") == "OK"
+            ]
+            if ok_questions:
+                try:
+                    llm_result = verify_questions_llm(
+                        ok_questions,
+                        LLMVerifyConfig(model=last_model_used, temperature=0.1)
+                    )
+                    # 결과 병합
+                    verified["questions"] = merge_verification_results(
+                        verified.get("questions", []),
+                        llm_result.get("questions", [])
+                    )
+                    # summary 재계산
+                    new_summary = {"OK": 0, "FIXABLE": 0, "REJECT": 0}
+                    for q in verified["questions"]:
+                        v = q.get("verdict", "OK")
+                        if v in new_summary:
+                            new_summary[v] += 1
+                    verified["summary"] = new_summary
+                    verified["llm_verify_done"] = True
+                except Exception as e:
+                    logger.warning(f"LLM 검증 실패: {e}")
+                    verified["llm_verify_done"] = False
+
+        # ---- 2.5) FIXABLE 문제 재생성 (Job 단위, 최대 3회) ----
+        MAX_FIXABLE_RETRIES = 3
+        fixable_retry_count = 0
+        target_q = int(job.get("target_questions") or 0) or 2
+
+        while fixable_retry_count < MAX_FIXABLE_RETRIES:
+            current_summary = verified.get("summary", {})
+            fixable_count = current_summary.get("FIXABLE", 0)
+            reject_count = current_summary.get("REJECT", 0)
+            ok_count = current_summary.get("OK", 0)
+
+            # OK 문제가 목표 개수 이상이면 종료
+            if ok_count >= target_q:
+                break
+
+            # FIXABLE/REJECT 문제가 없으면 종료
+            need_regen = fixable_count + reject_count
+            if need_regen == 0:
+                break
+
+            fixable_retry_count += 1
+            logger.info(f"  [{jid}] FIXABLE 재생성 시도 {fixable_retry_count}/{MAX_FIXABLE_RETRIES}: "
+                        f"OK={ok_count}, FIXABLE={fixable_count}, REJECT={reject_count}, target={target_q}")
+
+            # (명세 job state) 재생성 중
+            _write_job_state(
+                data_dir=data_dir,
+                pdf_id=pdf_id,
+                job_id=jid,
+                section_id=section_id if isinstance(section_id, str) else None,
+                local_status=JobStatusLocal.GENERATING,
+                model=last_model_used,
+                attempts=fixable_retry_count,
+                model_plan=model_plan,
+                progress_value=0.5,
+            )
+
+            # OK 문제 유지, FIXABLE/REJECT 문제는 제외
+            ok_questions = [q for q in verified.get("questions", []) if q.get("verdict") == "OK"]
+            excluded_texts = [
+                (q.get("question_text") or q.get("question", "")).lower().strip()
+                for q in ok_questions
+            ]
+
+            # 부족한 개수만큼 재생성
+            additional_needed = target_q - ok_count
+            if additional_needed <= 0:
+                break
+
+            # 재생성용 job 복사
+            regen_job = dict(job)
+            regen_job["target_questions"] = additional_needed
+            regen_job["exclude_texts"] = excluded_texts
+
+            try:
+                gen_cfg = get_gen_cfg(last_model_used)
+                regen_result = generate_questions_for_job(regen_job, gen_cfg, tables=norm_tables)
+                new_questions = regen_result.get("questions", [])
+
+                if new_questions:
+                    # 새 문제 구조 검증
+                    new_verified = verify_questions_batch(new_questions)
+                    new_qs_with_verdict = new_verified.get("questions", [])
+
+                    # 기존 OK 문제 + 새 문제 병합
+                    merged_questions = ok_questions + new_qs_with_verdict
+
+                    # summary 재계산
+                    new_summary = {"OK": 0, "FIXABLE": 0, "REJECT": 0}
+                    for q in merged_questions:
+                        v = q.get("verdict", "OK")
+                        if v in new_summary:
+                            new_summary[v] += 1
+
+                    verified["questions"] = merged_questions
+                    verified["summary"] = new_summary
+                    verified["fixable_retries"] = fixable_retry_count
+
+                    logger.info(f"    재생성 결과: +{len(new_questions)}개, 새 OK={new_summary['OK']}")
+                else:
+                    logger.warning(f"    재생성 실패: 빈 결과")
+                    break
+            except Exception as e:
+                logger.warning(f"    재생성 중 오류: {e}")
+                break
 
         # ---- 3) DONE (runner-local) ----
         now = _now_iso()
@@ -979,6 +1112,137 @@ def run(
         qs2 = it.get("questions")
         return len(qs2) if isinstance(qs2, list) else 0
 
+    # =============================================================================
+    # Phase 3: Aggregate 검증 및 재생성 루프
+    # =============================================================================
+
+    # 전체 문제 수집
+    all_questions: List[Dict[str, Any]] = []
+    for it in items:
+        if it.get("status") != JobStatusLocal.DONE:
+            continue
+        job_id = it.get("job_id")
+        section_id = it.get("section_id")
+        for q in it.get("questions", []):
+            if isinstance(q, dict):
+                q_copy = dict(q)
+                q_copy["job_id"] = job_id
+                q_copy["section_id"] = section_id
+                all_questions.append(q_copy)
+
+    # Job별 target_questions 맵 생성
+    job_targets: Dict[str, int] = {}
+    for job in jobs:
+        jid = job.get("job_id")
+        tq = job.get("target_questions", 0)
+        if jid:
+            job_targets[jid] = tq
+
+    # target_total 결정
+    effective_target = target_total if target_total > 0 else sum(job_targets.values())
+
+    # Aggregate 검증
+    aggregate_result = verify_aggregate(
+        target_total=effective_target,
+        all_questions=all_questions,
+        job_targets=job_targets,
+    )
+
+    logger.info(f"Aggregate 검증: 목표={effective_target}, OK={aggregate_result.actual_ok}, "
+                f"부족={aggregate_result.deficit}, 중복={aggregate_result.duplicate_count}")
+
+    # 재생성 루프 (부족/중복 있을 경우)
+    regeneration_rounds = 0
+    if not aggregate_result.is_satisfied and max_regeneration_rounds > 0:
+        logger.info(f"재생성 필요: {aggregate_result.issues}")
+
+        for regen_round in range(max_regeneration_rounds):
+            if aggregate_result.is_satisfied:
+                break
+
+            regeneration_rounds += 1
+            logger.info(f"재생성 라운드 {regeneration_rounds}/{max_regeneration_rounds}")
+
+            # 중복 제거
+            if aggregate_result.duplicate_count > 0:
+                all_questions, removed = remove_duplicates(all_questions)
+                logger.info(f"  중복 제거: {len(removed)}개")
+
+            # 재생성 대상 식별
+            targets = identify_regeneration_targets(
+                aggregate_result,
+                jobs,
+                all_questions,
+            )
+
+            if not targets:
+                logger.info("  재생성 대상 없음")
+                break
+
+            # 재생성 실행
+            for target in targets:
+                logger.info(f"  재생성: {target.job_id} +{target.additional_count}개 ({target.reason})")
+
+                # 해당 Job 찾기
+                target_job = next((j for j in jobs if j.get("job_id") == target.job_id), None)
+                if not target_job:
+                    continue
+
+                try:
+                    # 추가 문제 생성
+                    target_job_copy = dict(target_job)
+                    target_job_copy["target_questions"] = target.additional_count
+                    target_job_copy["exclude_texts"] = target.exclude_texts
+
+                    gen_cfg = QuestionGenConfig(model=default_model, temperature=temperature)
+                    gen_result = generate_questions_for_job(target_job_copy, gen_cfg)
+
+                    new_questions = gen_result.get("questions", [])
+                    if new_questions:
+                        # 구조 검증
+                        verified_new = verify_questions_batch(new_questions)
+
+                        verified_questions = verified_new.get("questions", [])
+                        for q in verified_questions:
+                            q["job_id"] = target.job_id
+                            q["section_id"] = target.section_id
+                            q["regenerated"] = True
+                            q["regeneration_round"] = regen_round + 1
+                            all_questions.append(q)
+
+                        # ✅ items에도 재생성된 문제 추가 (aggregate JSON 저장용)
+                        for it in items:
+                            if it.get("job_id") == target.job_id:
+                                if "questions" not in it or not isinstance(it["questions"], list):
+                                    it["questions"] = []
+                                it["questions"].extend(verified_questions)
+                                # summary 업데이트
+                                ok_count = sum(1 for q in it["questions"] if q.get("verdict") == "OK")
+                                fixable_count = sum(1 for q in it["questions"] if q.get("verdict") == "FIXABLE")
+                                reject_count = sum(1 for q in it["questions"] if q.get("verdict") == "REJECT")
+                                it["summary"] = {"OK": ok_count, "FIXABLE": fixable_count, "REJECT": reject_count}
+                                it["updated_at"] = _now_iso()
+                                # FAILED 상태였으면 DONE으로 변경
+                                if it.get("status") == JobStatusLocal.FAILED and ok_count > 0:
+                                    it["status"] = JobStatusLocal.DONE
+                                break
+
+                        logger.info(f"    생성됨: {len(new_questions)}개")
+                except Exception as e:
+                    logger.warning(f"    재생성 실패: {e}")
+
+            # 재검증
+            aggregate_result = verify_aggregate(
+                target_total=effective_target,
+                all_questions=all_questions,
+                job_targets=job_targets,
+            )
+
+            logger.info(f"  재검증: OK={aggregate_result.actual_ok}, 부족={aggregate_result.deficit}")
+
+    # Aggregate 결과 저장
+    save_aggregate_result(aggregate_result, out_dir / "aggregate_verify_result.json")
+
     agg = {
         "pdf_id": pdf_id,
         "updated_at": _now_iso(),
@@ -986,16 +1250,20 @@ def run(
             "jobs_total": len(jobs),
             "jobs_done": sum(1 for it in items if it.get("status") == JobStatusLocal.DONE),
             "jobs_failed": sum(1 for it in items if it.get("status") == JobStatusLocal.FAILED),
-            "questions_total": sum(_safe_questions_len(it) for it in items if it.get("status") == JobStatusLocal.DONE),
-            "verdict_ok": sum(it.get("summary", {}).get("OK", 0) for it in items if it.get("status") == JobStatusLocal.DONE),
-            "verdict_fixable": sum(it.get("summary", {}).get("FIXABLE", 0) for it in items if it.get("status") == JobStatusLocal.DONE),
-            "verdict_reject": sum(it.get("summary", {}).get("REJECT", 0) for it in items if it.get("status") == JobStatusLocal.DONE),
+            "questions_total": len(all_questions),
+            "verdict_ok": aggregate_result.actual_ok,
+            "verdict_fixable": sum(1 for q in all_questions if q.get("verdict") == "FIXABLE"),
+            "verdict_reject": sum(1 for q in all_questions if q.get("verdict") == "REJECT"),
+            "target_total": effective_target,
+            "is_satisfied": aggregate_result.is_satisfied,
+            "regeneration_rounds": regeneration_rounds,
         },
         "paths": {
             "verified_dir": str(verified_dir),
             "generated_dir": str(generated_dir) if save_generated else None,
             "answers_dir": str(answers_dir) if save_answers_only else None,
         },
+        "aggregate_issues": aggregate_result.issues,
         "items": items,
     }
     _atomic_write_json(out_dir / "questions_verified_aggregate.json", agg)
@@ -1053,6 +1321,11 @@ def main():
     # NEW: 명세 기반 저장 루트
     ap.add_argument("--data_dir", default="data", help="명세 저장 루트 (data/jobs, data/results 등)")
 
+    # 검증 파이프라인 옵션
+    ap.add_argument("--no_llm_verify", action="store_true", help="LLM 품질 검증 비활성화")
+    ap.add_argument("--target_total", type=int, default=0, help="목표 문제 총 개수 (0이면 job별 합계)")
+    ap.add_argument("--max_regen_rounds", type=int, default=2, help="최대 재생성 라운드 (0이면 재생성 안함)")
+
     args = ap.parse_args()
 
     run(
@@ -1073,6 +1346,10 @@ def main():
         save_answers_only=not args.no_answers_only,
         save_generated=args.save_generated,
         data_dir=Path(args.data_dir),
+        # 검증 파이프라인 옵션
+        enable_llm_verify=not args.no_llm_verify,
+        target_total=args.target_total,
+        max_regeneration_rounds=args.max_regen_rounds,
     )
 
 

@@ -7,6 +7,26 @@ from typing import Any, Dict, List, Optional, Set
 # =========================
 # ENUM (명세 고정)
 # =========================
+from enum import Enum
+
+
+class QuestionType(str, Enum):
+    MCQ = "MCQ"  # 객관식
+    SAQ = "SAQ"  # 단답형
+
+
+class Difficulty(str, Enum):
+    EASY = "easy"
+    MEDIUM = "medium"
+    HARD = "hard"
+
+
+class Verdict(str, Enum):
+    OK = "OK"           # 정상 → 그대로 사용
+    FIXABLE = "FIXABLE" # 수정 가능 → 재생성 트리거
+    REJECT = "REJECT"   # 반려 → 폐기
+
+
 QUESTION_TYPES = {"MCQ", "SAQ"}
 DIFFICULTIES = {"easy", "medium", "hard"}
 VERDICTS = {"OK", "FIXABLE", "REJECT"}
@@ -113,9 +133,9 @@ def verify_questions_for_job(
             current_verdict = _upgrade_verdict(current_verdict, "REJECT")
 
         # =================
-        # 2) question text 중복 & 길이
+        # 2) question text 중복 & 길이 (question_text/question 호환)
         # =================
-        qtext_raw = q.get("question")
+        qtext_raw = q.get("question_text") or q.get("question")
         qtext_norm = (qtext_raw or "").strip().lower()
 
         if qtext_norm:
@@ -186,15 +206,15 @@ def verify_questions_for_job(
                     current_verdict = _upgrade_verdict(current_verdict, "FIXABLE")
 
         # =================
-        # 5) MCQ 구조 검증
+        # 5) MCQ 구조 검증 (options/choices, correct_answer/answer 호환)
         # =================
         if qtype == "MCQ":
-            ans = q.get("answer")
+            ans = q.get("correct_answer") or q.get("answer")
             if ans not in {"A", "B", "C", "D"}:
                 additional_issues.append("MCQ answer must be A/B/C/D")
                 current_verdict = _upgrade_verdict(current_verdict, "REJECT")
 
-            choices = q.get("choices")
+            choices = q.get("options") or q.get("choices")
             if not isinstance(choices, list):
                 additional_issues.append("MCQ missing choices")
                 current_verdict = _upgrade_verdict(current_verdict, "REJECT")
@@ -214,22 +234,22 @@ def verify_questions_for_job(
                         current_verdict = _upgrade_verdict(current_verdict, "FIXABLE")
 
         # =================
-        # 6) SAQ 구조 검증
+        # 6) SAQ 구조 검증 (correct_answer/answer 호환)
         # =================
         if qtype == "SAQ":
-            ans = q.get("answer")
+            ans = q.get("correct_answer") or q.get("answer")
             if not _is_nonempty_str(ans):
                 additional_issues.append("SAQ missing answer")
                 current_verdict = _upgrade_verdict(current_verdict, "REJECT")
 
             # SAQ는 choices 없어야 하나, LLM이 choices: []/null을 넣는 경우가 흔함 → 완화
-            ch = q.get("choices", None)
+            ch = q.get("options") or q.get("choices", None)
             if ch not in (None, [], ""):
                 additional_issues.append("SAQ should not include choices")
                 current_verdict = _upgrade_verdict(current_verdict, "FIXABLE")
 
         # =================
-        # 7) explanation 검증 (REJECT는 피하고 대부분 FIXABLE)
+        # 7) explanation 검증
         # =================
         explanation = q.get("explanation", "")
         expl = str(explanation).strip() if explanation is not None else ""
@@ -241,11 +261,54 @@ def verify_questions_for_job(
             current_verdict = _upgrade_verdict(current_verdict, "FIXABLE")
 
         # =================
+        # ✅ 8) generated_table 검증 (표 기반 문제인 경우)
+        # =================
+        gen_table = q.get("generated_table")
+        if gen_table is not None:
+            if not isinstance(gen_table, dict):
+                additional_issues.append("generated_table must be object")
+                current_verdict = _upgrade_verdict(current_verdict, "FIXABLE")
+            else:
+                headers = gen_table.get("headers")
+                rows = gen_table.get("rows")
+                
+                if not isinstance(headers, list) or not headers:
+                    additional_issues.append("generated_table missing/invalid headers")
+                    current_verdict = _upgrade_verdict(current_verdict, "FIXABLE")
+                
+                if not isinstance(rows, list) or not rows:
+                    additional_issues.append("generated_table missing/invalid rows")
+                    current_verdict = _upgrade_verdict(current_verdict, "FIXABLE")
+                elif headers and isinstance(headers, list):
+                    # 각 row의 길이가 headers와 맞는지 체크
+                    for i, row in enumerate(rows):
+                        if not isinstance(row, list):
+                            additional_issues.append(f"generated_table row {i} must be array")
+                            current_verdict = _upgrade_verdict(current_verdict, "FIXABLE")
+                            break
+                        if len(row) != len(headers):
+                            additional_issues.append(
+                                f"generated_table row {i} length mismatch (expected {len(headers)}, got {len(row)})"
+                            )
+                            current_verdict = _upgrade_verdict(current_verdict, "FIXABLE")
+
+        # =================
         # 최종 결과 저장
         # =================
+        all_issues = list(gen_issues) + additional_issues
+
+        # confidence 계산: 구조 검증은 확정적이므로 기본 1.0, 이슈마다 감소
+        if current_verdict == "OK":
+            confidence = 1.0
+        elif current_verdict == "FIXABLE":
+            confidence = max(0.5, 1.0 - len(all_issues) * 0.1)
+        else:  # REJECT
+            confidence = max(0.3, 0.8 - len(all_issues) * 0.1)
+
         q_out = dict(q)
         q_out["verdict"] = current_verdict
-        q_out["issues"] = list(gen_issues) + additional_issues
+        q_out["issues"] = all_issues
+        q_out["confidence"] = round(confidence, 2)
         q_out["verified_at"] = _now_iso()
 
         verified.append(q_out)
@@ -264,3 +327,205 @@ def verify_questions_for_job(
             "valid_chunk_ids": len(valid_chunk_ids),
         },
     }
+
+
+# =========================
+# StructureVerifyConfig
+# =========================
+from dataclasses import dataclass
+
+
+@dataclass
+class StructureVerifyConfig:
+    """구조 검증 설정"""
+    min_question_length: int = 8
+    max_question_length: int = 700
+    min_explanation_length: int = 8
+    check_duplicates: bool = True
+
+
+# =========================
+# Batch Verification
+# =========================
+def verify_questions_batch(
+    questions: List[Dict[str, Any]],
+    config: Optional[StructureVerifyConfig] = None,
+) -> Dict[str, Any]:
+    """
+    문제 리스트를 일괄 검증 (Job 없이 독립 사용 가능)
+
+    Args:
+        questions: 검증할 문제 리스트
+        config: 검증 설정 (선택)
+
+    Returns:
+        {
+            "verified_at": str,
+            "summary": {"OK": int, "FIXABLE": int, "REJECT": int},
+            "questions": List[Question with verdict, issues, confidence]
+        }
+    """
+    if config is None:
+        config = StructureVerifyConfig()
+
+    if not questions:
+        return {
+            "verified_at": _now_iso(),
+            "summary": {"OK": 0, "FIXABLE": 0, "REJECT": 0},
+            "questions": [],
+        }
+
+    results: List[Dict[str, Any]] = []
+    summary = {"OK": 0, "FIXABLE": 0, "REJECT": 0}
+
+    seen_texts: Set[str] = set()
+
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+
+        result = _verify_single_question(q, config, seen_texts)
+        results.append(result)
+        summary[result["verdict"]] += 1
+
+        # 중복 체크용 텍스트 수집
+        q_text = q.get("question_text") or q.get("question", "")
+        norm_text = q_text.strip().lower() if q_text else ""
+        if norm_text:
+            seen_texts.add(norm_text)
+
+    return {
+        "verified_at": _now_iso(),
+        "summary": summary,
+        "questions": results,
+    }
+
+
+def _verify_single_question(
+    question: Dict[str, Any],
+    config: StructureVerifyConfig,
+    seen_texts: Set[str],
+) -> Dict[str, Any]:
+    """단일 문제 구조 검증"""
+    issues: List[str] = []
+    verdict = "OK"
+
+    # 1. question_id 검증
+    qid = question.get("question_id")
+    if not _is_nonempty_str(qid):
+        issues.append("missing question_id")
+        verdict = _upgrade_verdict(verdict, "REJECT")
+
+    # 2. question_text 검증 (question_text/question 호환)
+    q_text = question.get("question_text") or question.get("question", "")
+    if not q_text or not q_text.strip():
+        issues.append("missing question_text")
+        verdict = _upgrade_verdict(verdict, "REJECT")
+    else:
+        q_len = len(q_text.strip())
+        if q_len < config.min_question_length:
+            issues.append(f"question too short (<{config.min_question_length} chars)")
+            verdict = _upgrade_verdict(verdict, "FIXABLE")
+        elif q_len > config.max_question_length:
+            issues.append(f"question too long (>{config.max_question_length} chars)")
+            verdict = _upgrade_verdict(verdict, "FIXABLE")
+
+        # 중복 체크
+        if config.check_duplicates:
+            norm_text = q_text.strip().lower()
+            if norm_text in seen_texts:
+                issues.append("duplicate question text")
+                verdict = _upgrade_verdict(verdict, "FIXABLE")
+
+    # 3. type 검증
+    qtype = question.get("type")
+    if qtype not in QUESTION_TYPES:
+        issues.append(f"invalid question type: {qtype}")
+        verdict = _upgrade_verdict(verdict, "REJECT")
+
+    # 4. difficulty 검증
+    diff = question.get("difficulty")
+    if diff not in DIFFICULTIES:
+        issues.append(f"invalid difficulty: {diff}")
+        verdict = _upgrade_verdict(verdict, "FIXABLE")
+
+    # 5. MCQ 검증 (options/choices, correct_answer/answer 호환)
+    if qtype == "MCQ":
+        choices = question.get("options") or question.get("choices", [])
+        answer = question.get("correct_answer") or question.get("answer")
+
+        if not isinstance(choices, list):
+            issues.append("MCQ missing options")
+            verdict = _upgrade_verdict(verdict, "REJECT")
+        elif len(choices) < 3 or len(choices) > 5:
+            issues.append(f"MCQ should have 3-5 options, got {len(choices)}")
+            verdict = _upgrade_verdict(verdict, "FIXABLE")
+        else:
+            # 선택지 중복 체크
+            norm_choices = [str(c).strip().lower() for c in choices]
+            if len(set(norm_choices)) != len(choices):
+                issues.append("duplicate options")
+                verdict = _upgrade_verdict(verdict, "FIXABLE")
+
+        if answer not in {"A", "B", "C", "D", "E"}:
+            issues.append(f"MCQ answer must be A-E, got: {answer}")
+            verdict = _upgrade_verdict(verdict, "REJECT")
+
+    # 6. SAQ 검증
+    if qtype == "SAQ":
+        answer = question.get("correct_answer") or question.get("answer")
+        if not _is_nonempty_str(answer):
+            issues.append("SAQ missing answer")
+            verdict = _upgrade_verdict(verdict, "REJECT")
+
+    # 7. explanation 검증
+    explanation = question.get("explanation", "")
+    if not explanation or not str(explanation).strip():
+        issues.append("missing explanation")
+        verdict = _upgrade_verdict(verdict, "FIXABLE")
+    elif len(str(explanation).strip()) < config.min_explanation_length:
+        issues.append(f"explanation too short (<{config.min_explanation_length} chars)")
+        verdict = _upgrade_verdict(verdict, "FIXABLE")
+
+    # 8. generated_table 검증
+    gen_table = question.get("generated_table")
+    if gen_table is not None:
+        if not isinstance(gen_table, dict):
+            issues.append("generated_table must be object")
+            verdict = _upgrade_verdict(verdict, "FIXABLE")
+        else:
+            headers = gen_table.get("headers")
+            rows = gen_table.get("rows")
+
+            if not isinstance(headers, list) or not headers:
+                issues.append("generated_table missing headers")
+                verdict = _upgrade_verdict(verdict, "FIXABLE")
+
+            if not isinstance(rows, list) or not rows:
+                issues.append("generated_table missing rows")
+                verdict = _upgrade_verdict(verdict, "FIXABLE")
+            elif isinstance(headers, list) and headers:
+                for i, row in enumerate(rows):
+                    if not isinstance(row, list):
+                        issues.append(f"generated_table row {i} must be array")
+                        verdict = _upgrade_verdict(verdict, "FIXABLE")
+                    elif len(row) != len(headers):
+                        issues.append(f"generated_table row {i} length mismatch")
+                        verdict = _upgrade_verdict(verdict, "FIXABLE")
+
+    # confidence 계산
+    if verdict == "OK":
+        confidence = 1.0
+    elif verdict == "FIXABLE":
+        confidence = max(0.5, 1.0 - len(issues) * 0.1)
+    else:  # REJECT
+        confidence = max(0.3, 0.8 - len(issues) * 0.1)
+
+    # 원본 복사 후 검증 결과 추가
+    q_out = dict(question)
+    q_out["verdict"] = verdict
+    q_out["issues"] = issues
+    q_out["confidence"] = round(confidence, 2)
+    q_out["verified_at"] = _now_iso()
+
+    return q_out

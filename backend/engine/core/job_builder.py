@@ -1,4 +1,4 @@
-# core/job_builder.py
+# core/job_builder.py (전체)
 from __future__ import annotations
 
 import argparse
@@ -15,52 +15,44 @@ class JobBuilderConfig:
     out_dir: Path = Path("artifacts/lecture")
     pdf_id: str = "lecture"
 
-    # Inputs
     sections_filename: str = "sections.json"
     pages_text_filename: str = "pages_text.json"
     tables_by_page_filename: str = "tables_by_page.json"
 
-    # Outputs
     jobs_jsonl: str = "question_jobs.jsonl"
     index_json: str = "question_jobs_index.json"
     overwrite: bool = True
 
-    # Section size control
     MIN_CHARS: int = 2000
     TARGET_CHARS: int = 9000
     MAX_CHARS: int = 13000
 
-    # Small section buffering (by pages)
     SMALL_BUFFER_PREV_PAGES: int = 1
     SMALL_BUFFER_NEXT_PAGES: int = 1
 
-    # If still too small after buffering, allow deterministic merge with next section (max 1 merge)
     ALLOW_MERGE_TINY_WITH_NEXT: bool = True
 
-    # Text formatting
     page_separator: str = "\n\n----- PAGE {page_index} -----\n\n"
 
-    # Question allocation
-    TOTAL_Q: int = 0  # ✅ 0이면 자동 산정
+    TOTAL_Q: int = 0
     MIN_Q_PER_SECTION: int = 2
     MAX_Q_PER_SECTION: int = 10
     TABLE_BONUS: float = 2.5
 
-    # Auto TOTAL_Q policy
-    AUTO_Q_PER_SECTION: int = 3         # 기본: 섹션당 3문제
-    AUTO_CHARS_PER_Q: int = 3000        # 길이 기반 보정
-    AUTO_BLEND_SECTION: float = 0.7     # 섹션기반 비중
-    AUTO_BLEND_LENGTH: float = 0.3      # 길이기반 비중
+    AUTO_Q_PER_SECTION: int = 3
+    AUTO_CHARS_PER_Q: int = 3000
+    AUTO_BLEND_SECTION: float = 0.7
+    AUTO_BLEND_LENGTH: float = 0.3
     AUTO_MIN_TOTAL: int = 30
     AUTO_MAX_TOTAL: int = 120
 
-    # Table enforcement
     REQUIRE_TABLE_Q_IF_TABLES: bool = True
 
+    # 문제 유형/난이도 설정 (API 명세)
+    difficulty: str = "mixed"  # easy | medium | hard | mixed
+    types_ratio_mcq: float = 1.0  # MCQ 비율 (0.0 ~ 1.0)
+    types_ratio_saq: float = 0.0  # SAQ 비율 (0.0 ~ 1.0)
 
-# =========================
-# IO helpers
-# =========================
 
 def _read_json(path: Path) -> Any:
     with open(path, "r", encoding="utf-8") as f:
@@ -78,10 +70,6 @@ def _write_json(path: Path, obj: Any) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
-# =========================
-# Parsing helpers
-# =========================
-
 def _ensure_pages_list(pages_text: Any) -> List[Dict[str, Any]]:
     if isinstance(pages_text, dict) and isinstance(pages_text.get("pages"), list):
         return pages_text["pages"]
@@ -91,23 +79,15 @@ def _ensure_pages_list(pages_text: Any) -> List[Dict[str, Any]]:
 
 
 def _ensure_sections_list(sections_obj: Any) -> List[Dict[str, Any]]:
-    """
-    sections.json variations:
-    - [{...}, {...}]
-    - {"sections":[...]} / {"items":[...]} / {"data":[...]}
-    - {"index":{"items":[...]}} / {"result":{"sections":[...]}} (rare)
-    """
     if isinstance(sections_obj, list):
         return [s for s in sections_obj if isinstance(s, dict)]
 
     if isinstance(sections_obj, dict):
-        # 1-depth wrappers
         for key in ("sections", "items", "data"):
             v = sections_obj.get(key)
             if isinstance(v, list):
                 return [s for s in v if isinstance(s, dict)]
 
-        # 2-depth wrappers
         for key in ("index", "result", "payload", "output"):
             v = sections_obj.get(key)
             if isinstance(v, dict):
@@ -116,7 +96,7 @@ def _ensure_sections_list(sections_obj: Any) -> List[Dict[str, Any]]:
                     if isinstance(v2, list):
                         return [s for s in v2 if isinstance(s, dict)]
 
-    raise ValueError("sections.json must be a list of section objects (or an object wrapping such a list)")
+    raise ValueError("sections.json must be a list of section objects")
 
 
 def _page_text(page_obj: Dict[str, Any]) -> str:
@@ -232,25 +212,13 @@ def _tables_for_pages(pages: List[int], tables_by_page: Dict[int, List[Dict[str,
     return out
 
 
-# =========================
-# TOTAL_Q auto policy
-# =========================
-
 def _auto_total_q(num_sections: int, total_chars: int, cfg: JobBuilderConfig) -> int:
-    # 섹션 기반
     q_sec = num_sections * cfg.AUTO_Q_PER_SECTION
-    # 길이 기반
     q_len = int(math.ceil(max(total_chars, 1) / max(cfg.AUTO_CHARS_PER_Q, 1)))
-    # 블렌딩
     q = int(round(cfg.AUTO_BLEND_SECTION * q_sec + cfg.AUTO_BLEND_LENGTH * q_len))
-    # clamp
     q = max(cfg.AUTO_MIN_TOTAL, min(cfg.AUTO_MAX_TOTAL, q))
     return q
 
-
-# =========================
-# Allocation policy
-# =========================
 
 def _compute_section_weights(section_infos: List[Dict[str, Any]], table_bonus: float) -> List[float]:
     weights: List[float] = []
@@ -279,11 +247,9 @@ def _allocate_questions(
     raw = [total_q * (w / wsum) for w in weights]
     alloc = [int(math.floor(x)) for x in raw]
 
-    # min/max
     alloc = [max(min_q, min(max_q, a)) for a in alloc]
     cur = sum(alloc)
 
-    # reduce if too many
     if cur > total_q:
         idxs = sorted(range(len(alloc)), key=lambda i: alloc[i], reverse=True)
         guard = 0
@@ -300,7 +266,6 @@ def _allocate_questions(
                 break
             guard += 1
 
-    # add if too few
     if cur < total_q:
         idxs = sorted(range(len(alloc)), key=lambda i: weights[i], reverse=True)
         guard = 0
@@ -319,10 +284,6 @@ def _allocate_questions(
 
     return alloc
 
-
-# =========================
-# Job building
-# =========================
 
 def _split_pages_into_jobs(
     pages: List[int],
@@ -369,7 +330,7 @@ def _expand_with_buffer(pages: List[int], num_pages_total: int, prev_n: int, nex
     return list(range(bstart, bend + 1))
 
 
-def _build_jobs(cfg: JobBuilderConfig) -> Dict[str, Any]:
+def _build_jobs(cfg: JobBuilderConfig, skip_allocation: bool = False, external_allocation: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     base = Path(cfg.out_dir)
     sections_path = base / cfg.sections_filename
     pages_text_path = base / cfg.pages_text_filename
@@ -380,7 +341,6 @@ def _build_jobs(cfg: JobBuilderConfig) -> Dict[str, Any]:
     if not pages_text_path.exists():
         raise FileNotFoundError(f"Missing: {pages_text_path}")
 
-    # ✅ sections.json schema variations absorb
     sections_obj = _read_json(sections_path)
     sections = _ensure_sections_list(sections_obj)
 
@@ -391,7 +351,7 @@ def _build_jobs(cfg: JobBuilderConfig) -> Dict[str, Any]:
     tables_obj = _read_json(tables_path) if tables_path.exists() else None
     tables_by_page = _normalize_tables_by_page(tables_obj)
 
-    # 1) Collect section stats first (for auto TOTAL_Q + allocation)
+    # 1) section stats 수집
     section_infos: List[Dict[str, Any]] = []
     total_chars_all_sections = 0
 
@@ -414,23 +374,35 @@ def _build_jobs(cfg: JobBuilderConfig) -> Dict[str, Any]:
             "has_tables": len(tables) > 0,
         })
 
-    # 2) Decide TOTAL_Q (auto if 0)
-    total_q_final = cfg.TOTAL_Q
-    if total_q_final <= 0:
-        total_q_final = _auto_total_q(len(section_infos), total_chars_all_sections, cfg)
+    # ✅ 2) Allocation (외부 allocation 우선 적용)
+    if external_allocation:
+        # Orchestrator에서 받은 allocation 사용
+        print(f"✅ 외부 allocation 사용: {external_allocation}")
+        total_q_final = sum(external_allocation.values())
+        for s in section_infos:
+            sid = s["section_id"]
+            s["target_questions"] = external_allocation.get(sid, 0)
+    elif skip_allocation:
+        print("⚠️ 문제 배분 건너뛰기 (orchestrator에서 처리)")
+        for s in section_infos:
+            s["target_questions"] = 0
+        total_q_final = 0
+    else:
+        total_q_final = cfg.TOTAL_Q
+        if total_q_final <= 0:
+            total_q_final = _auto_total_q(len(section_infos), total_chars_all_sections, cfg)
 
-    # 3) Allocate questions per section deterministically
-    alloc = _allocate_questions(
-        section_infos,
-        total_q=total_q_final,
-        min_q=cfg.MIN_Q_PER_SECTION,
-        max_q=cfg.MAX_Q_PER_SECTION,
-        table_bonus=cfg.TABLE_BONUS,
-    )
-    for s, q in zip(section_infos, alloc):
-        s["target_questions"] = int(q)
+        alloc = _allocate_questions(
+            section_infos,
+            total_q=total_q_final,
+            min_q=cfg.MIN_Q_PER_SECTION,
+            max_q=cfg.MAX_Q_PER_SECTION,
+            table_bonus=cfg.TABLE_BONUS,
+        )
+        for s, q in zip(section_infos, alloc):
+            s["target_questions"] = int(q)
 
-    # 4) Build jobs with size control (buffer/merge/split)
+    # 3) Build jobs
     jobs: List[Dict[str, Any]] = []
     sec_summary: List[Dict[str, Any]] = []
 
@@ -451,13 +423,11 @@ def _build_jobs(cfg: JobBuilderConfig) -> Dict[str, Any]:
         merged_with_next = False
         merged_section_ids = [section_id]
 
-        # build initial context
         text, page_texts = _build_text_for_pages(job_pages, pages_list, cfg.page_separator)
         tables = _tables_for_pages(job_pages, tables_by_page)
         char_count = len(text)
         has_tables = len(tables) > 0
 
-        # small: add buffer pages
         if char_count < cfg.MIN_CHARS and pages:
             job_pages = _expand_with_buffer(
                 pages,
@@ -471,7 +441,6 @@ def _build_jobs(cfg: JobBuilderConfig) -> Dict[str, Any]:
             char_count = len(text)
             has_tables = len(tables) > 0
 
-        # still tiny: merge with next section (max 1) deterministically
         if cfg.ALLOW_MERGE_TINY_WITH_NEXT and char_count < cfg.MIN_CHARS and (i + 1) < len(sections):
             sec_next = sections[i + 1]
             if isinstance(sec_next, dict):
@@ -486,7 +455,6 @@ def _build_jobs(cfg: JobBuilderConfig) -> Dict[str, Any]:
                 merged_section_ids = [section_id, next_id]
                 job_pages = merged_pages
 
-        # split to jobs
         page_jobs = _split_pages_into_jobs(
             pages=job_pages,
             page_texts=page_texts,
@@ -494,15 +462,49 @@ def _build_jobs(cfg: JobBuilderConfig) -> Dict[str, Any]:
             max_chars=cfg.MAX_CHARS,
         )
 
-        target_q = next((x["target_questions"] for x in section_infos if x["section_id"] == section_id), cfg.MIN_Q_PER_SECTION)
+        # ✅ target_q 가져오기 (병합된 섹션의 할당량 합산)
+        target_q = 0
+        for merged_sid in merged_section_ids:
+            for x in section_infos:
+                if x["section_id"] == merged_sid:
+                    target_q += x.get("target_questions", 0)
+                    break
+
+        # external_allocation 사용 시 0이면 기본값 적용 안함
+        if target_q == 0 and not skip_allocation and external_allocation is None:
+            target_q = cfg.MIN_Q_PER_SECTION
+
+        # ✅ 0 할당이면 Job 생성 건너뛰기
+        if target_q == 0:
+            # 섹션 요약에는 기록하되 Job은 생성하지 않음
+            sec_summary.append({
+                "section_id": section_id,
+                "title": title,
+                "pages": pages,
+                "primary_pages": primary_pages,
+                "job_pages_union": sorted(set(p for g in page_jobs for p in g)),
+                "buffered": buffered,
+                "merged_with_next": merged_with_next,
+                "merged_section_ids": merged_section_ids,
+                "target_questions": 0,
+                "num_jobs": 0,
+                "has_tables": has_tables,
+                "char_count_final": char_count,
+                "skipped": True,  # ✅ 건너뛴 표시
+            })
+            i += 2 if merged_with_next else 1
+            continue
 
         n_jobs = max(1, len(page_jobs))
         base_q = target_q // n_jobs
         rem = target_q % n_jobs
         per_job_q = [base_q + (1 if j < rem else 0) for j in range(n_jobs)]
-        per_job_q = [max(1, int(x)) for x in per_job_q]
+        # ✅ 최소값 강제 제거 (external_allocation 사용 시)
+        if external_allocation is not None:
+            per_job_q = [max(0, int(x)) for x in per_job_q]
+        else:
+            per_job_q = [max(0 if skip_allocation else 1, int(x)) for x in per_job_q]
 
-        # table job marking (earliest job containing any table page)
         table_job_index: Optional[int] = None
         if cfg.REQUIRE_TABLE_Q_IF_TABLES and has_tables:
             for j, g in enumerate(page_jobs):
@@ -517,23 +519,31 @@ def _build_jobs(cfg: JobBuilderConfig) -> Dict[str, Any]:
             grp_tables = _tables_for_pages(page_group, tables_by_page)
             job_id = f"{section_id}_J{j+1:02d}"
 
+            # types_ratio 계산 (비율 정규화)
+            total_ratio = cfg.types_ratio_mcq + cfg.types_ratio_saq
+            if total_ratio > 0:
+                types_ratio = {
+                    "MCQ": round(cfg.types_ratio_mcq / total_ratio, 2),
+                    "SAQ": round(cfg.types_ratio_saq / total_ratio, 2),
+                }
+            else:
+                types_ratio = {"MCQ": 1.0, "SAQ": 0.0}
+
             jobs.append({
                 "job_id": job_id,
                 "pdf_id": cfg.pdf_id,
-
                 "section_id": section_id,
                 "section_title": title,
-
                 "primary_pages": primary_pages,
                 "job_pages": page_group,
                 "merged_section_ids": merged_section_ids,
                 "buffered": buffered,
                 "merged_with_next": merged_with_next,
-
                 "text": grp_text,
                 "tables": grp_tables,
-
                 "target_questions": int(per_job_q[j]),
+                "difficulty": cfg.difficulty,  # API 명세 필드
+                "types_ratio": types_ratio,    # API 명세 필드
                 "constraints": {
                     "must_use_tables": bool(cfg.REQUIRE_TABLE_Q_IF_TABLES and (table_job_index == j)),
                     "has_tables_in_job": len(grp_tables) > 0,
@@ -592,16 +602,8 @@ def _build_jobs(cfg: JobBuilderConfig) -> Dict[str, Any]:
             "REQUIRE_TABLE_Q_IF_TABLES": cfg.REQUIRE_TABLE_Q_IF_TABLES,
             "TOTAL_Q_requested": cfg.TOTAL_Q,
             "TOTAL_Q_effective": total_q_final,
-            "AUTO": {
-                "AUTO_Q_PER_SECTION": cfg.AUTO_Q_PER_SECTION,
-                "AUTO_CHARS_PER_Q": cfg.AUTO_CHARS_PER_Q,
-                "AUTO_BLEND_SECTION": cfg.AUTO_BLEND_SECTION,
-                "AUTO_BLEND_LENGTH": cfg.AUTO_BLEND_LENGTH,
-                "AUTO_MIN_TOTAL": cfg.AUTO_MIN_TOTAL,
-                "AUTO_MAX_TOTAL": cfg.AUTO_MAX_TOTAL,
-                "total_chars_all_sections": total_chars_all_sections,
-                "num_sections_used": len(section_infos),
-            }
+            "skip_allocation": skip_allocation,
+            "external_allocation_used": external_allocation is not None,
         },
         "summary": {
             "num_sections": len(sec_summary),
@@ -633,12 +635,21 @@ def main():
     ap.add_argument("--buffer_prev", type=int, default=1)
     ap.add_argument("--buffer_next", type=int, default=1)
     ap.add_argument("--no_require_table_q", action="store_true")
+    
+    # ✅ 추가
+    ap.add_argument("--skip_allocation", action="store_true",
+                    help="문제 개수 배분 건너뛰기 (orchestrator 사용 시)")
+    ap.add_argument("--allocation_file", type=str, default=None,
+                    help="Orchestrator에서 생성한 allocation.json 파일 경로")
 
-    # auto policy knobs (optional)
-    ap.add_argument("--auto_q_per_section", type=int, default=3)
-    ap.add_argument("--auto_chars_per_q", type=int, default=3000)
-    ap.add_argument("--auto_min_total", type=int, default=30)
-    ap.add_argument("--auto_max_total", type=int, default=120)
+    # 문제 유형/난이도 설정 (API 명세)
+    ap.add_argument("--difficulty", type=str, default="mixed",
+                    choices=["easy", "medium", "hard", "mixed"],
+                    help="문제 난이도 (easy/medium/hard/mixed)")
+    ap.add_argument("--mcq_ratio", type=float, default=1.0,
+                    help="MCQ(객관식) 비율 (0.0~1.0)")
+    ap.add_argument("--saq_ratio", type=float, default=0.0,
+                    help="SAQ(단답형) 비율 (0.0~1.0)")
 
     args = ap.parse_args()
 
@@ -646,28 +657,32 @@ def main():
         out_dir=Path(args.out_dir),
         pdf_id=args.pdf_id,
         overwrite=args.overwrite,
-
         TOTAL_Q=args.total_q,
         MIN_Q_PER_SECTION=args.min_q,
         MAX_Q_PER_SECTION=args.max_q,
-
         MIN_CHARS=args.min_chars,
         TARGET_CHARS=args.target_chars,
         MAX_CHARS=args.max_chars,
-
         SMALL_BUFFER_PREV_PAGES=args.buffer_prev,
         SMALL_BUFFER_NEXT_PAGES=args.buffer_next,
         ALLOW_MERGE_TINY_WITH_NEXT=not args.no_merge_tiny,
-
         REQUIRE_TABLE_Q_IF_TABLES=not args.no_require_table_q,
-
-        AUTO_Q_PER_SECTION=args.auto_q_per_section,
-        AUTO_CHARS_PER_Q=args.auto_chars_per_q,
-        AUTO_MIN_TOTAL=args.auto_min_total,
-        AUTO_MAX_TOTAL=args.auto_max_total,
+        difficulty=args.difficulty,
+        types_ratio_mcq=args.mcq_ratio,
+        types_ratio_saq=args.saq_ratio,
     )
 
-    index = _build_jobs(cfg)
+    # ✅ allocation 파일 읽기
+    external_allocation = None
+    if args.allocation_file:
+        alloc_path = Path(args.allocation_file)
+        if alloc_path.exists():
+            external_allocation = _read_json(alloc_path)
+            print(f"✅ Allocation 파일 로드: {alloc_path}")
+        else:
+            print(f"⚠️ Allocation 파일 없음: {alloc_path}")
+
+    index = _build_jobs(cfg, skip_allocation=args.skip_allocation, external_allocation=external_allocation)
     print(f"[OK] jobs={index['summary']['num_jobs']} total_q={index['policy']['TOTAL_Q_effective']}")
     print(f" -> {Path(args.out_dir) / cfg.jobs_jsonl}")
     print(f" -> {Path(args.out_dir) / cfg.index_json}")
@@ -675,4 +690,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

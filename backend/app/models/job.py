@@ -21,7 +21,7 @@ class JobStatus(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     
     job_id: str
-    status: Literal["RUNNING", "DONE", "FAILED"]
+    status: Literal["QUEUED", "RUNNING", "DONE", "FAILED"]
     progress: Optional[Progress] = None
     error: Optional[JobError] = None
     

@@ -27,9 +27,10 @@ class GradingService:
         if not question_data:
             raise ValueError(f"Question not found: {question_id} in {pdf_id}")
 
-        # 필드명 매핑
+        # 필드명 매핑 (엔진 출력 형식에 맞춤)
         q_type = question_data.get("type", "MCQ")
-        correct_answer = str(question_data.get("answer", "")).strip()
+        # 엔진은 correct_answer로 저장, 하위 호환성을 위해 answer도 확인
+        correct_answer = str(question_data.get("correct_answer") or question_data.get("answer", "")).strip()
         q_text = question_data.get("question_text", question_data.get("question", ""))
 
         user_answer_str = user_answer.strip()
